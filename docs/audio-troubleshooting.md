@@ -56,8 +56,7 @@ shader code and save formats are unchanged.
    same opening-audio bytes and still reject traversal. `probe-audio` checks
    constructed mixer/decoder state without opening an audio device; it does not
    prove that in-game streaming or the selected speaker/headphones are audible.
-   For a 1.1.2 app, use `rewritten/v112` instead. The added resource integration
-   checks have been exercised locally on 1.0.0, not on 1.1.2.
+   The added resource integration checks have been exercised locally on 1.0.0.
 
 5. Play the opening scene and confirm both dialogue and background music through
    the intended output device. This listening check confirmed the 1.0.0 fix on
@@ -67,7 +66,8 @@ shader code and save formats are unchanged.
 
 - Check the current macOS output device and volume. Test a known system sound;
   if that also fails, inspect the device connection first.
-- Check `~/Library/Logs/MacNativeGames/totk.log` for CoreAudio setup failures,
+- Turn on the log (`defaults write org.macnativegames.totk TOTK_DEBUG_LOG -bool YES`,
+  then start the game again) and check `~/Library/Logs/MacNativeGames/totk.log` for CoreAudio setup failures,
   decode errors and output-level reports. A nonzero mixed level does not by
   itself prove the selected physical output is audible.
 - For local file-open diagnostics, quit the game normally and launch with:
@@ -85,7 +85,66 @@ Do not upload game packages, extracted resources, keys, saves, generated runtime
 tables or complete logs when sharing a report. Describe the game version, the
 scene, the output device, and relevant redacted error messages instead.
 
+## Audio effects and output buffering (2026-10-18)
+
+The renderer runs every known effect type (1-9): besides the auxiliary send/return, 3D reverb and limiter it already had,
+delay, plain reverb (its early reflections chosen by the early mode), compressor, effect-level biquads, buffer mix and
+capture. It also fixes the revision decoding, the six-channel mapping, compressor statistics, PCM24 input, the circular
+sink and a fast Stop -> Start queue, and keeps the mixing scratch state per renderer instance. Output starts once 20 ms of
+audio is queued, also after an underrun; `TOTK_AUDIO_PREFILL_MS=<0..500>` changes that, rounded up to 5 ms render blocks
+(0 / 20 / 40 ms ran without underruns in the tests behind the 20 ms default). This work came from the original port and
+was merged with this repository's REV15 float biquads for 1.4.3.
+
+After the output device stalls (a Bluetooth headset reconnecting, a CoreAudio hiccup) the mixer keeps at most the prefill
+plus 30 ms queued and drops older audio, so the delay does not stay (#64); the `output level` line counts these as
+`backlog trims N (M frames)`.
+
+Checks, without game data:
+
+- `./build/totk-native-v143 rewritten/v143 probe-audio`: 46,587 production-mixer checks, REV15 voices and splitters
+  included; with `TOTK_AUDIO_STOP_RELEASE=0` or `TOTK_AUDIO_REV15_NEGATIVE=1` it must fail.
+- `make test-audio-effects RYUJINX_AUDIO_REF=<folder with Ryujinx.Audio.dll> DOTNET=<dotnet>`: 24 groups, 1,872,000
+  samples against an unmodified Ryujinx.Audio (largest difference 4.47e-08), then 1,885,461 checks of the production
+  effect graph, routing, capture / circular buffers and output prefill / recovery / stop.
+
+## Audio lost through splitter submix chains (2026-10-22)
+
+The submix ordering previously followed only `dest_mix_id`, even when the mixer
+actually routed through `dest_splitter_id`. A receiving submix could therefore
+be processed before its source. Samples arriving later were never propagated
+to the final mix and were cleared on the next frame.
+
+Ordering now follows every used splitter destination with an active receiving
+mix. Depths are memoized per frame, with a recursion guard for malformed cycles.
+The game-data-free regression exercises direct routing, one splitter, two
+splitters, and a branching path that rejoins a downstream submix:
+
+```sh
+python3 -m unittest discover -s tests -p test_audio_routing.py -v
+```
+
+It compares production-mixer stereo output against independently calculated
+PCM values under UBSan. The two-splitter and branching cases output zeros before
+the fix; all four cases pass afterwards. This verifies routing, while an actual
+in-game listening check is still needed to establish the cause of a particular
+missing-sound report.
+
 ## 中文说明
+
+### 多级混音分流导致音效丢失（2026-10-22）
+
+`audio_mixer.c` 原先只根据 `dest_mix_id` 排序子混音，忽略了分流器指向的
+接收通道。接收通道如果提前输出，后续送入它的声音就无法到达最终输出。
+现在排序会遍历所有启用的分流目标，确保源通道先于每个接收通道处理；
+每帧缓存依赖深度，循环依赖也有边界保护。
+
+无需游戏资源的回归测试包含直接路由、单级分流、两级分流和分支汇合，
+将生产混音器的左右声道与独立计算的 PCM 期望值比较，并启用 UBSan。
+修复前，两级分流及分支汇合两组输出为零；修复后四组均通过。
+运行下方英文部分中的测试命令即可复现。这确认了路由修复；具体场景中的
+缺音症状仍需在游戏内试听，不能仅凭测试通过判定已经解决。
+
+### 流式资源路径
 
 这次确认的问题是：游戏将音频资源拼成了 `content://Sound/...`，旧版
 RomFS 解析器只去掉一个根目录斜杠，随后又将剩余斜杠判为非法路径，导致
@@ -99,7 +158,19 @@ RomFS 解析器只去掉一个根目录斜杠，随后又将剩余斜杠判为�
 验证分三层：27 个无需游戏数据的解析器用例；`probe-fs` 对真实开场音频进行
 单/双/三斜杠路径读取比对；最后实际播放开场，确认对白和配乐。音频混音自检
 单独通过并不代表真实游戏流式播放正常。已实测 1.0.0 开场，不将结果外推为
-所有场景、1.1.2 或其他游戏均已验证。
+所有场景或其他游戏均已验证。
 
 如果仍然无声，先确认 macOS 输出设备与系统提示音，再检查日志中的
 CoreAudio/解码错误及音频电平。着色器首次编译造成的卡顿属于另一类问题。
+
+### 音效与输出缓冲（2026-10-18）
+
+已知的音效类型 1–9 都能执行：原有的辅助收发、3D 混响、限幅器之外，补上了延迟、普通混响（早期反射按 EarlyMode 选表）、压缩器、
+效果级双二阶滤波、BufferMix 和 Capture；修正了 revision 解码、六声道映射、压缩器统计、PCM24、环形输出和快速 Stop → Start 的旧队列，
+混音用的临时状态改成每个实例各一份。输出在攒够 20 ms 声音后开始（欠载之后也一样），`TOTK_AUDIO_PREFILL_MS=<0..500>` 可以改，
+按 5 ms 的渲染块向上取整（定 20 ms 之前，0 / 20 / 40 ms 的测试局都没有欠载）。这些来自原移植项目，合并时保留了本仓库为 1.4.3 加的
+REV15 浮点双二阶滤波。
+
+不用游戏数据的检查：`./build/totk-native-v143 rewritten/v143 probe-audio`（生产混音器 46,587 项，含 REV15；加
+`TOTK_AUDIO_STOP_RELEASE=0` 或 `TOTK_AUDIO_REV15_NEGATIVE=1` 时必须失败）；`make test-audio-effects RYUJINX_AUDIO_REF=<Ryujinx.Audio.dll 所在目录> DOTNET=<dotnet>`
+（对未修改的 Ryujinx.Audio 共 24 组、1,872,000 个样本，最大误差 4.47e-08；再加效果图、路由、环形缓冲、预填充 / 欠载恢复 / 停止 1,885,461 项）。
